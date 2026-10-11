@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -11,12 +12,17 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from renamer.core import (  # noqa: E402
+    UNDO_LOG_NAME,
     RenameRule,
+    UndoError,
     apply_plan,
     format_plan,
     iter_files,
     plan_renames,
+    read_undo_log,
+    revert_from_log,
     sanitize,
+    undo_log_path,
 )
 
 
@@ -24,6 +30,21 @@ def make_files(tmp_path: Path, *names: str) -> list[Path]:
     for name in names:
         (tmp_path / name).write_text("x", encoding="utf-8")
     return sorted(tmp_path.iterdir())
+
+
+def make_ordered_files(tmp_path: Path, *specs: tuple[str, int, float]) -> list[Path]:
+    """Create ``(name, size, mtime)`` files and return them in creation order.
+
+    Sizes and mtimes are set explicitly (``os.utime``) instead of relying on how
+    fast the test happens to run, so the ordering assertions are deterministic.
+    """
+    paths: list[Path] = []
+    for name, size, mtime in specs:
+        path = tmp_path / name
+        path.write_bytes(b"x" * size)
+        os.utime(path, (mtime, mtime))
+        paths.append(path)
+    return paths
 
 
 # --- pure planning ---------------------------------------------------------
@@ -86,6 +107,127 @@ def test_unchanged_files_are_not_changes(tmp_path):
     assert plan.is_safe
 
 
+# --- ordering --------------------------------------------------------------
+
+
+def test_default_sort_is_still_name_order(tmp_path):
+    """Without an explicit sort, files are processed by name, case-insensitive."""
+    files = make_ordered_files(
+        tmp_path,
+        ("b.txt", 30, 300.0),
+        ("A.txt", 10, 100.0),
+        ("c.txt", 20, 200.0),
+    )
+    plan = plan_renames(files, RenameRule(number_padding=2), number=True)
+    assert [op.source.name for op in plan.operations] == ["A.txt", "b.txt", "c.txt"]
+    assert [op.new_name for op in plan.changes] == ["A_01.txt", "b_02.txt", "c_03.txt"]
+
+
+def test_sort_mtime_is_newest_first(tmp_path):
+    files = make_ordered_files(
+        tmp_path,
+        ("old.txt", 10, 1_000_000.0),
+        ("newest.txt", 10, 3_000_000.0),
+        ("middle.txt", 10, 2_000_000.0),
+    )
+    plan = plan_renames(
+        files, RenameRule(number_padding=2), number=True, sort="mtime"
+    )
+    assert [op.source.name for op in plan.operations] == [
+        "newest.txt",
+        "middle.txt",
+        "old.txt",
+    ]
+    assert [op.new_name for op in plan.changes] == [
+        "newest_01.txt",
+        "middle_02.txt",
+        "old_03.txt",
+    ]
+
+
+def test_sort_size_is_biggest_first(tmp_path):
+    files = make_ordered_files(
+        tmp_path,
+        ("small.txt", 1, 1_000.0),
+        ("big.txt", 300, 2_000.0),
+        ("medium.txt", 50, 3_000.0),
+    )
+    plan = plan_renames(files, RenameRule(number_padding=2), number=True, sort="size")
+    assert [op.source.name for op in plan.operations] == [
+        "big.txt",
+        "medium.txt",
+        "small.txt",
+    ]
+    assert [op.new_name for op in plan.changes] == [
+        "big_01.txt",
+        "medium_02.txt",
+        "small_03.txt",
+    ]
+
+
+def test_sort_none_preserves_input_order(tmp_path):
+    files = make_ordered_files(
+        tmp_path,
+        ("c.txt", 10, 1_000.0),
+        ("a.txt", 20, 2_000.0),
+        ("b.txt", 30, 3_000.0),
+    )
+    # deliberately neither name order nor size/mtime order
+    given = [files[2], files[0], files[1]]
+    plan = plan_renames(given, RenameRule(number_padding=2), number=True, sort="none")
+    assert [op.source.name for op in plan.operations] == ["b.txt", "c.txt", "a.txt"]
+    assert [op.new_name for op in plan.changes] == ["b_01.txt", "c_02.txt", "a_03.txt"]
+
+
+def test_bool_sort_argument_is_still_supported(tmp_path):
+    """The old bool switch keeps its meaning: True = by name, False = as given."""
+    files = make_ordered_files(
+        tmp_path,
+        ("b.txt", 10, 1_000.0),
+        ("a.txt", 20, 2_000.0),
+    )
+    legacy_true = plan_renames(files, RenameRule(), sort=True)
+    legacy_false = plan_renames(files, RenameRule(), sort=False)
+    assert [op.source.name for op in legacy_true.operations] == ["a.txt", "b.txt"]
+    assert [op.source.name for op in legacy_false.operations] == ["b.txt", "a.txt"]
+
+    # ...and agree with the string spelling they now map onto
+    by_name = plan_renames(files, RenameRule(), sort="name")
+    by_none = plan_renames(files, RenameRule(), sort="none")
+    assert [op.source.name for op in by_name.operations] == ["a.txt", "b.txt"]
+    assert [op.source.name for op in by_none.operations] == ["b.txt", "a.txt"]
+
+
+def test_files_that_cannot_be_statted_sort_last(tmp_path):
+    """A missing file has no mtime/size: it must not crash the planner."""
+    files = make_ordered_files(
+        tmp_path,
+        ("old.txt", 10, 1_000.0),
+        ("big.txt", 900, 500.0),
+    )
+    missing = tmp_path / "gone.txt"  # never created -> stat() raises FileNotFoundError
+
+    by_mtime = plan_renames([*files, missing], RenameRule(), sort="mtime")
+    assert [op.source.name for op in by_mtime.operations] == [
+        "old.txt",
+        "big.txt",
+        "gone.txt",
+    ]
+
+    by_size = plan_renames([*files, missing], RenameRule(), sort="size")
+    assert [op.source.name for op in by_size.operations] == [
+        "big.txt",
+        "old.txt",
+        "gone.txt",
+    ]
+
+
+def test_unknown_sort_mode_is_rejected(tmp_path):
+    files = make_ordered_files(tmp_path, ("a.txt", 1, 1_000.0))
+    with pytest.raises(ValueError):
+        plan_renames(files, RenameRule(), sort="newest")
+
+
 # --- safety checks ---------------------------------------------------------
 
 
@@ -137,7 +279,9 @@ def test_apply_renames_on_disk(tmp_path):
     plan = plan_renames(list(tmp_path.iterdir()), RenameRule(find="IMG", replace="pic"))
     apply_plan(plan)
 
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["pic_1.png", "pic_2.png"]
+    # apply_plan also writes the undo log into the directory; ignore it here.
+    names = sorted(p.name for p in tmp_path.iterdir() if p.name != UNDO_LOG_NAME)
+    assert names == ["pic_1.png", "pic_2.png"]
 
 
 def test_apply_refuses_unsafe_plan(tmp_path):
@@ -207,3 +351,118 @@ def test_format_plan_hides_preview_when_unsafe(tmp_path):
     text = format_plan(plan)
     assert "->" not in text
     assert "No changes will be made" in text
+
+
+# --- undo ------------------------------------------------------------------
+
+
+def test_apply_then_undo_restores_original_names(tmp_path):
+    make_files(tmp_path, "IMG_1.png", "IMG_2.png")
+    plan = plan_renames(list(tmp_path.iterdir()), RenameRule(find="IMG", replace="pic"))
+    apply_plan(plan)
+
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name != UNDO_LOG_NAME) == [
+        "pic_1.png",
+        "pic_2.png",
+    ]
+
+    restored = revert_from_log(tmp_path)
+    assert len(restored) == 2
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert names == ["IMG_1.png", "IMG_2.png"]
+    # the log is popped, and an empty stack leaves no file behind
+    assert not undo_log_path(tmp_path).exists()
+
+
+def test_apply_writes_an_undo_entry(tmp_path):
+    make_files(tmp_path, "a.txt")
+    plan = plan_renames(list(tmp_path.iterdir()), RenameRule(prefix="new_"))
+    apply_plan(plan)
+
+    entries = read_undo_log(tmp_path)
+    assert len(entries) == 1
+    steps = entries[-1].steps
+    assert len(steps) == 1
+    assert steps[0].original == "a.txt"
+    assert steps[0].final == "new_a.txt"
+
+
+def test_undo_without_a_log_errors_cleanly(tmp_path):
+    make_files(tmp_path, "a.txt")
+    with pytest.raises(UndoError):
+        revert_from_log(tmp_path)
+    # nothing changed
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.txt"]
+
+
+def test_undo_refuses_when_a_renamed_file_is_missing(tmp_path):
+    make_files(tmp_path, "a.txt")
+    plan = plan_renames(list(tmp_path.iterdir()), RenameRule(prefix="new_"))
+    apply_plan(plan)
+
+    (tmp_path / "new_a.txt").unlink()
+
+    with pytest.raises(UndoError):
+        revert_from_log(tmp_path)
+    assert not (tmp_path / "a.txt").exists()
+
+
+def test_undo_refuses_when_the_original_name_is_taken(tmp_path):
+    make_files(tmp_path, "a.txt")
+    plan = plan_renames(list(tmp_path.iterdir()), RenameRule(prefix="new_"))
+    apply_plan(plan)
+
+    # something else now occupies the name we would restore
+    (tmp_path / "a.txt").write_text("intruder", encoding="utf-8")
+
+    with pytest.raises(UndoError):
+        revert_from_log(tmp_path)
+    assert (tmp_path / "new_a.txt").exists()
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "intruder"
+
+
+def test_undo_unwinds_two_batches_in_reverse_order(tmp_path):
+    make_files(tmp_path, "a.txt")
+
+    first = plan_renames(list(tmp_path.iterdir()), RenameRule(prefix="one_"))
+    apply_plan(first)
+    # Exclude the undo log: apply_plan just wrote it, and renaming it would make
+    # the second batch (and therefore the undo stack) meaningless.
+    remaining = [p for p in tmp_path.iterdir() if p.name != UNDO_LOG_NAME]
+    second = plan_renames(remaining, RenameRule(prefix="two_"))
+    apply_plan(second)
+
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name != UNDO_LOG_NAME) == [
+        "two_one_a.txt"
+    ]
+
+    revert_from_log(tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name != UNDO_LOG_NAME) == [
+        "one_a.txt"
+    ]
+    revert_from_log(tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.txt"]
+    assert not undo_log_path(tmp_path).exists()
+
+
+def test_undo_log_is_not_treated_as_a_file_to_rename(tmp_path):
+    make_files(tmp_path, "a.txt")
+    plan = plan_renames(list(tmp_path.iterdir()), RenameRule(prefix="new_"))
+    apply_plan(plan)
+
+    # iter_files must skip the bookkeeping file, otherwise a second run would
+    # try to rename the undo log itself.
+    names = [p.name for p in iter_files(tmp_path)]
+    assert names == ["new_a.txt"]
+
+
+def test_apply_rejects_a_corrupt_undo_log_before_renaming(tmp_path):
+    make_files(tmp_path, "a.txt")
+    undo_log_path(tmp_path).write_text("{not json", encoding="utf-8")
+
+    plan = plan_renames(list(tmp_path.iterdir()), RenameRule(prefix="new_"))
+    with pytest.raises(UndoError):
+        apply_plan(plan)
+    # a corrupt log must not cost the user the batch: nothing was renamed
+    assert (tmp_path / "a.txt").exists()
+    assert not (tmp_path / "new_a.txt").exists()

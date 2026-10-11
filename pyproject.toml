@@ -21,10 +21,26 @@ classifiers = [
 renamer = "renamer.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+# >=7.3 because tmp_path_retention_policy below was added in that release.
+dev = ["pytest>=7.3"]
 
 [tool.setuptools]
 packages = ["renamer"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A sandboxed run may get a read-only system temp dir: pytest's default base temp
+# (`%TEMP%\pytest-of-<user>`) then cannot be created, and tests using pytest's own
+# temp fixtures fail with PermissionError. `tmp_path` is already redirected into the
+# project by tests/conftest.py; the two keys below apply the same fix to pytest's
+# built-in temp machinery (`tmp_path_factory` / `tmpdir`), which that override does
+# not cover. A relative --basetemp value IS supported — pytest resolves it with
+# os.path.abspath(), so it is relative to the *current working directory*, not to
+# pytest's rootdir: run pytest from the project root. That directory is deleted and
+# recreated at session start, so keep nothing of value inside it (`_scratch/` is
+# git-ignored). The equivalent explicit command is:
+#   pytest --basetemp=./_scratch
+addopts = "--basetemp=./_scratch"
+# Requires pytest >= 7.3; on pytest 7.0-7.2 (still allowed by the `dev` extra) the
+# key is ignored with an "Unknown config option" warning instead of taking effect.
+tmp_path_retention_policy = "none"

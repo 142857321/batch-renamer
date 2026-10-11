@@ -21,6 +21,10 @@ coverage.xml
 htmlcov/
 .tox/
 
+# Scratch and demo folders — throwaway, safe to delete, never commit
+_scratch/
+_demo/
+
 # Editor and OS files
 .vscode/*
 !.vscode/settings.json
